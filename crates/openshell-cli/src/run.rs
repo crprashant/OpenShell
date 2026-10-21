@@ -11,10 +11,10 @@ use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
     confirm_global_setting_takeover, format_epoch_ms, format_setting_value, format_timestamp,
     format_timestamp_ms, handle_platform_progress_event, is_provisioning_progress_event,
-    non_empty_or, parse_cli_setting_value, parse_duration_to_ms, phase_name,
-    print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
-    provisioning_timeout_message, ready_false_condition_message, scrub_git_env, short_hash,
-    truncate_status_field,
+    is_scheduling_wait_event, non_empty_or, parse_cli_setting_value, parse_duration_to_ms,
+    phase_name, print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
+    provisioning_timeout_message, ready_false_condition_message, scheduling_wait_condition,
+    scheduling_wait_message, scrub_git_env, short_hash, truncate_status_field,
 };
 pub use crate::commands::gateway::{
     gateway_add, gateway_info, gateway_info_not_configured, gateway_list, gateway_login,
@@ -838,7 +838,7 @@ pub async fn sandbox_create(
     let mut last_phase = sandbox.phase();
     let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
-    let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
+    let mut last_condition_message = provisioning_status_message(sandbox.status.as_ref());
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -912,7 +912,7 @@ pub async fn sandbox_create(
                 let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase();
                 last_sandbox = s.clone();
-                if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
+                if let Some(message) = provisioning_status_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
 
@@ -967,6 +967,13 @@ pub async fn sandbox_create(
                 }
             }
             Some(openshell_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
+                if is_scheduling_wait_event(&ev) && !ev.message.is_empty() {
+                    last_condition_message = Some(if ev.reason.is_empty() {
+                        ev.message.clone()
+                    } else {
+                        format!("{}: {}", ev.reason, ev.message)
+                    });
+                }
                 let extends_timeout = is_provisioning_progress_event(&ev);
                 // Silent mode suppresses all progress output; only update
                 // the deadline when applicable.
@@ -1687,6 +1694,9 @@ where
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(message) = scheduling_wait_message(sandbox.status.as_ref()) {
+        println!("  {} {}", "Scheduling:".dimmed(), message);
+    }
     if let Some(status) = sandbox.status.as_ref() {
         for condition in &status.conditions {
             if matches!(
@@ -2974,6 +2984,10 @@ pub async fn sandbox_list(
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
+        let phase_colored = match list_scheduling_hint(&sandbox) {
+            Some(hint) => format!("{phase_colored} {}", hint.dimmed()),
+            None => phase_colored,
+        };
         let created = format_epoch_ms(
             sandbox
                 .metadata
@@ -2999,6 +3013,29 @@ pub async fn sandbox_list(
     }
 
     Ok(())
+}
+
+/// Most useful status detail while provisioning: a scheduling wait explains
+/// why the sandbox is stuck better than the generic `Ready=False` condition.
+fn provisioning_status_message(
+    status: Option<&openshell_core::proto::SandboxStatus>,
+) -> Option<String> {
+    scheduling_wait_message(status).or_else(|| ready_false_condition_message(status))
+}
+
+/// Short `sandbox list` annotation for a provisioning sandbox the platform
+/// cannot schedule yet, e.g. `(Unschedulable)`.
+fn list_scheduling_hint(sandbox: &Sandbox) -> Option<String> {
+    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Provisioning) {
+        return None;
+    }
+    let condition = scheduling_wait_condition(sandbox.status.as_ref())?;
+    let reason = if condition.reason.is_empty() {
+        "Unschedulable"
+    } else {
+        condition.reason.as_str()
+    };
+    Some(format!("({reason})"))
 }
 
 fn configuration_failure_message(sandbox: &Sandbox) -> Option<&str> {
@@ -8112,6 +8149,85 @@ mod tests {
         };
 
         assert!(ready_false_condition_message(Some(&status)).is_none());
+    }
+
+    fn unscheduled_sandbox(phase: SandboxPhase) -> Sandbox {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                conditions: vec![
+                    SandboxCondition {
+                        r#type: "Ready".to_string(),
+                        status: "False".to_string(),
+                        reason: "DependenciesNotReady".to_string(),
+                        message: "Pod exists with phase: Pending".to_string(),
+                        transition_time: None,
+                    },
+                    SandboxCondition {
+                        r#type: "PodScheduled".to_string(),
+                        status: "False".to_string(),
+                        reason: "Unschedulable".to_string(),
+                        message: "0/3 nodes are available: 3 Insufficient memory.".to_string(),
+                        transition_time: None,
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(phase as i32);
+        sandbox
+    }
+
+    #[test]
+    fn provisioning_status_message_prefers_scheduling_wait() {
+        let sandbox = unscheduled_sandbox(SandboxPhase::Provisioning);
+
+        assert_eq!(
+            super::provisioning_status_message(sandbox.status.as_ref()).as_deref(),
+            Some("Unschedulable: 0/3 nodes are available: 3 Insufficient memory.")
+        );
+
+        let mut scheduled = sandbox;
+        scheduled
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .retain(|condition| condition.r#type != "PodScheduled");
+        assert_eq!(
+            super::provisioning_status_message(scheduled.status.as_ref()).as_deref(),
+            Some("DependenciesNotReady: Pod exists with phase: Pending")
+        );
+    }
+
+    #[test]
+    fn list_scheduling_hint_only_marks_unscheduled_provisioning_sandboxes() {
+        assert_eq!(
+            super::list_scheduling_hint(&unscheduled_sandbox(SandboxPhase::Provisioning))
+                .as_deref(),
+            Some("(Unschedulable)")
+        );
+        assert!(super::list_scheduling_hint(&unscheduled_sandbox(SandboxPhase::Ready)).is_none());
+        assert!(super::list_scheduling_hint(&Sandbox::default()).is_none());
+    }
+
+    #[test]
+    fn sandbox_json_exposes_scheduling_wait_condition() {
+        let json = super::sandbox_to_json(&unscheduled_sandbox(SandboxPhase::Provisioning));
+
+        assert_eq!(json["phase"], "Provisioning");
+        let scheduling = json["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|condition| condition["type"] == "PodScheduled")
+            .expect("PodScheduled condition in JSON");
+        assert_eq!(scheduling["status"], "False");
+        assert_eq!(scheduling["reason"], "Unschedulable");
+        assert_eq!(
+            scheduling["message"],
+            "0/3 nodes are available: 3 Insufficient memory."
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
     PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
-    PROGRESS_STEP_STARTING_SANDBOX,
+    PROGRESS_STEP_STARTING_SANDBOX, PROGRESS_STEP_WAITING_FOR_SCHEDULING,
 };
 use openshell_core::proto::{
     PlatformEvent, SandboxPhase, SandboxPolicy, SettingValue, setting_value,
@@ -268,6 +268,9 @@ pub fn print_policy_merge_warnings(warnings: &[openshell_policy::PolicyMergeWarn
 pub enum ProvisioningStep {
     /// Sandbox CRD created, waiting for pod to be scheduled.
     RequestingSandbox,
+    /// The platform cannot place the sandbox yet (for example, the Kubernetes
+    /// scheduler reports no node fits). Not forward progress.
+    WaitingForScheduling,
     /// Pulling the sandbox container image.
     PullingSandboxImage,
     /// Container is starting up.
@@ -279,6 +282,7 @@ impl ProvisioningStep {
     pub fn completed_label(self) -> &'static str {
         match self {
             Self::RequestingSandbox => "Sandbox allocated",
+            Self::WaitingForScheduling => "Sandbox scheduled",
             Self::PullingSandboxImage => "Image pulled",
             Self::StartingSandbox => "Sandbox ready",
         }
@@ -288,6 +292,7 @@ impl ProvisioningStep {
     pub fn active_label(self) -> &'static str {
         match self {
             Self::RequestingSandbox => "Requesting sandbox...",
+            Self::WaitingForScheduling => "Waiting to be scheduled...",
             Self::PullingSandboxImage => "Pulling image...",
             Self::StartingSandbox => "Starting sandbox...",
         }
@@ -377,9 +382,16 @@ impl ProvisioningDisplay {
     }
 
     /// Set the active (in-progress) step shown on the spinner.
+    ///
+    /// Re-activating the current step keeps its elapsed timer, so repeated
+    /// wait events (such as scheduler retries) show the total wait time.
     pub fn set_active(&mut self, label: &str) {
-        self.active_label = label.to_string();
         self.active_detail.clear();
+        if self.active_label == label {
+            self.update_spinner();
+            return;
+        }
+        self.active_label = label.to_string();
         self.spinner.reset_elapsed();
         self.step_start = Instant::now();
         self.update_spinner();
@@ -435,6 +447,7 @@ impl ProvisioningDisplay {
 pub fn progress_step_from_metadata(value: &str) -> Option<ProvisioningStep> {
     match value {
         PROGRESS_STEP_REQUESTING_SANDBOX => Some(ProvisioningStep::RequestingSandbox),
+        PROGRESS_STEP_WAITING_FOR_SCHEDULING => Some(ProvisioningStep::WaitingForScheduling),
         PROGRESS_STEP_PULLING_IMAGE => Some(ProvisioningStep::PullingSandboxImage),
         PROGRESS_STEP_STARTING_SANDBOX => Some(ProvisioningStep::StartingSandbox),
         _ => None,
@@ -509,6 +522,12 @@ pub fn handle_platform_progress_event(
 }
 
 pub fn is_provisioning_progress_event(event: &PlatformEvent) -> bool {
+    // A scheduling wait is reported for visibility only. It must not keep an
+    // unschedulable sandbox alive past the idle provisioning deadline.
+    if is_scheduling_wait_event(event) {
+        return false;
+    }
+
     if event.metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY)
         || event.metadata.contains_key(PROGRESS_ACTIVE_STEP_KEY)
         || event.metadata.contains_key(PROGRESS_ACTIVE_DETAIL_KEY)
@@ -570,6 +589,47 @@ pub fn print_sandbox_header(
 // ---------------------------------------------------------------------------
 // Sandbox provisioning helpers
 // ---------------------------------------------------------------------------
+
+/// Condition type the compute driver publishes while the platform cannot
+/// place the sandbox (mirrors the Kubernetes `PodScheduled` pod condition).
+pub const SCHEDULING_CONDITION_TYPE: &str = "PodScheduled";
+
+/// Whether a platform event reports that the sandbox is waiting to be
+/// scheduled rather than making forward progress.
+pub fn is_scheduling_wait_event(event: &PlatformEvent) -> bool {
+    !event.metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY)
+        && event
+            .metadata
+            .get(PROGRESS_ACTIVE_STEP_KEY)
+            .is_some_and(|step| step == PROGRESS_STEP_WAITING_FOR_SCHEDULING)
+}
+
+/// The unschedulable condition the driver reports while the sandbox waits on
+/// the platform scheduler, if any.
+pub fn scheduling_wait_condition(
+    status: Option<&openshell_core::proto::SandboxStatus>,
+) -> Option<&openshell_core::proto::SandboxCondition> {
+    status?.conditions.iter().find(|condition| {
+        condition.r#type == SCHEDULING_CONDITION_TYPE
+            && condition.status.eq_ignore_ascii_case("false")
+    })
+}
+
+/// `reason: message` summary of the scheduling wait, if the sandbox is
+/// currently waiting to be scheduled.
+pub fn scheduling_wait_message(
+    status: Option<&openshell_core::proto::SandboxStatus>,
+) -> Option<String> {
+    scheduling_wait_condition(status).map(condition_summary)
+}
+
+fn condition_summary(condition: &openshell_core::proto::SandboxCondition) -> String {
+    match (condition.reason.is_empty(), condition.message.is_empty()) {
+        (false, false) => format!("{}: {}", condition.reason, condition.message),
+        (false, true) => condition.reason.clone(),
+        (true, _) => condition.message.clone(),
+    }
+}
 
 pub fn ready_false_condition_message(
     status: Option<&openshell_core::proto::SandboxStatus>,
@@ -1208,7 +1268,145 @@ mod tests {
         display.clear();
     }
 
-    // helper for building input
+    fn scheduling_wait_event(message: &str) -> PlatformEvent {
+        PlatformEvent {
+            source: "kubernetes".to_string(),
+            r#type: "Warning".to_string(),
+            reason: "FailedScheduling".to_string(),
+            message: message.to_string(),
+            metadata: HashMap::from([
+                (
+                    PROGRESS_ACTIVE_STEP_KEY.to_string(),
+                    PROGRESS_STEP_WAITING_FOR_SCHEDULING.to_string(),
+                ),
+                (PROGRESS_ACTIVE_DETAIL_KEY.to_string(), message.to_string()),
+            ]),
+            ..PlatformEvent::default()
+        }
+    }
+
+    #[test]
+    fn scheduling_wait_event_shows_reason_without_extending_deadline() {
+        let event = scheduling_wait_event("0/3 nodes are available: 3 Insufficient memory.");
+
+        assert!(is_scheduling_wait_event(&event));
+        assert!(!is_provisioning_progress_event(&event));
+
+        let mut display = ProvisioningDisplay::new();
+        assert!(handle_platform_progress_event(
+            &event,
+            Some(&mut display),
+            Instant::now(),
+        ));
+        assert_eq!(
+            display.active_label,
+            ProvisioningStep::WaitingForScheduling.active_label()
+        );
+        assert_eq!(
+            display.active_detail,
+            "0/3 nodes are available: 3 Insufficient memory."
+        );
+        assert!(display.completed_steps.is_empty());
+
+        // A repeated scheduler retry keeps the wait timer and updates the reason.
+        let started = display.step_start;
+        let retry = scheduling_wait_event("0/3 nodes are available: 3 Insufficient cpu.");
+        assert!(handle_platform_progress_event(
+            &retry,
+            Some(&mut display),
+            Instant::now(),
+        ));
+        assert_eq!(display.step_start, started);
+        assert_eq!(
+            display.active_detail,
+            "0/3 nodes are available: 3 Insufficient cpu."
+        );
+        display.clear();
+    }
+
+    #[test]
+    fn scheduled_event_after_wait_resumes_normal_steps() {
+        let mut display = ProvisioningDisplay::new();
+        handle_platform_progress_event(
+            &scheduling_wait_event("0/1 nodes are available: 1 Insufficient memory."),
+            Some(&mut display),
+            Instant::now(),
+        );
+
+        let scheduled = PlatformEvent {
+            reason: "Scheduled".to_string(),
+            metadata: HashMap::from([
+                (
+                    PROGRESS_COMPLETE_STEP_KEY.to_string(),
+                    PROGRESS_STEP_REQUESTING_SANDBOX.to_string(),
+                ),
+                (
+                    PROGRESS_COMPLETE_LABEL_KEY.to_string(),
+                    "Sandbox allocated".to_string(),
+                ),
+                (
+                    PROGRESS_ACTIVE_STEP_KEY.to_string(),
+                    PROGRESS_STEP_PULLING_IMAGE.to_string(),
+                ),
+            ]),
+            ..PlatformEvent::default()
+        };
+        assert!(!is_scheduling_wait_event(&scheduled));
+        assert!(is_provisioning_progress_event(&scheduled));
+        assert!(handle_platform_progress_event(
+            &scheduled,
+            Some(&mut display),
+            Instant::now(),
+        ));
+
+        assert_eq!(
+            display.completed_steps,
+            vec![ProvisioningStep::RequestingSandbox]
+        );
+        assert_eq!(
+            display.active_label,
+            ProvisioningStep::PullingSandboxImage.active_label()
+        );
+        assert!(display.active_detail.is_empty());
+        display.clear();
+    }
+
+    #[test]
+    fn scheduling_wait_message_reads_only_unscheduled_condition() {
+        use openshell_core::proto::{SandboxCondition, SandboxStatus};
+
+        let condition =
+            |r#type: &str, status: &str, reason: &str, message: &str| SandboxCondition {
+                r#type: r#type.to_string(),
+                status: status.to_string(),
+                reason: reason.to_string(),
+                message: message.to_string(),
+                transition_time: None,
+            };
+        let waiting = SandboxStatus {
+            conditions: vec![
+                condition("Ready", "False", "DependenciesNotReady", "pending"),
+                condition(
+                    "PodScheduled",
+                    "False",
+                    "Unschedulable",
+                    "0/3 nodes are available: 3 Insufficient memory.",
+                ),
+            ],
+            ..SandboxStatus::default()
+        };
+        assert_eq!(
+            scheduling_wait_message(Some(&waiting)).as_deref(),
+            Some("Unschedulable: 0/3 nodes are available: 3 Insufficient memory.")
+        );
+
+        let scheduled = SandboxStatus {
+            conditions: vec![condition("PodScheduled", "True", "", "")],
+            ..SandboxStatus::default()
+        };
+        assert!(scheduling_wait_message(Some(&scheduled)).is_none());
+        assert!(scheduling_wait_message(None).is_none());
+    }
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()

@@ -12,6 +12,12 @@ pub const PROGRESS_ACTIVE_STEP_KEY: &str = "openshell.progress.active_step";
 pub const PROGRESS_ACTIVE_DETAIL_KEY: &str = "openshell.progress.active_detail";
 
 pub const PROGRESS_STEP_REQUESTING_SANDBOX: &str = "requesting_sandbox";
+/// The platform accepted the sandbox but cannot place it yet.
+///
+/// For example, a Kubernetes pod the scheduler cannot fit on any node. This is
+/// a wait state, not forward progress, so clients should not treat it as
+/// extending an idle provisioning deadline.
+pub const PROGRESS_STEP_WAITING_FOR_SCHEDULING: &str = "waiting_for_scheduling";
 pub const PROGRESS_STEP_PULLING_IMAGE: &str = "pulling_image";
 pub const PROGRESS_STEP_STARTING_SANDBOX: &str = "starting_sandbox";
 
